@@ -1,10 +1,71 @@
-# LeJEPA
+# LeJEPA — projector ablation fork
 **Lean Joint-Embedding Predictive Architecture (LeJEPA): Provable and Scalable Self-Supervised Learning Without the Heuristics**
-[GitHub Repository](https://github.com/rbalestr-lab/lejepa)  
-[arXiv:2511.08544](https://arxiv.org/abs/2511.08544)
+[Upstream repository](https://github.com/galilai-group/lejepa) | [arXiv:2511.08544](https://arxiv.org/abs/2511.08544)
+
 ---
 
-Rush to our [minimal working example](MINIMAL.md) to see a full-fledge working example (ViT, inet).
+This fork investigates a theory-practice gap identified in
+[galilai-group/lejepa#17](https://github.com/galilai-group/lejepa/issues/17):
+the paper's Section 3 argues for optimality of isotropic Gaussian *embeddings*,
+but in the reference implementation SIGReg is applied to *projector outputs*.
+This means the theoretical guarantees apply to the projection space, not the
+embedding space used for downstream tasks.
+
+Two alternative designs are implemented and compared against the original
+in [`train.py`](train.py):
+
+| Variant | SIGReg target | Inv/pred loss target | Notes |
+|---|---|---|---|
+| `baseline` | projector output | projector output | original LeJEPA |
+| `sigreg_on_emb` | backbone embedding | projector output | Proposal 1 from #17: regularize what the theory actually requires |
+| `local_proj` | global-view embedding | local projector → global emb mean | Proposal 2 from #17: projector acts as a JEPA-style predictor on local views only |
+
+See [MINIMAL.md](MINIMAL.md) for the upstream minimal example this builds on.
+
+## Running the experiments
+
+First, log in to W&B (creates/uses a project under your own account):
+```bash
+wandb login
+```
+
+First, log in to W&B (creates/uses a project under your own account):
+```bash
+wandb login
+```
+
+Run all 30 experiments (3 variants × 10 seeds):
+```bash
+bash run_experiments.sh                          # single GPU, sequential
+bash run_experiments.sh --gpus 4                 # spread across 4 GPUs
+bash run_experiments.sh --project my-project     # override W&B project name
+```
+
+The script is idempotent: completed runs are recorded in `runs/.done/` and
+skipped on re-runs. To force a single run to re-execute:
+```bash
+rm runs/.done/baseline_seed3
+bash run_experiments.sh
+```
+
+Or run individual experiments:
+```bash
+uv run python train.py +variant=baseline      +lamb=0.02 +V=4 +proj_dim=16 +lr=2e-3 +bs=256 +epochs=200 +seed=0
+uv run python train.py +variant=sigreg_on_emb +lamb=0.02 +V=4 +proj_dim=16 +lr=2e-3 +bs=256 +epochs=200 +seed=0
+uv run python train.py +variant=local_proj    +lamb=0.02 +V_global=2 +V_local=2 +lr=2e-3 +bs=256 +epochs=200 +seed=0
+```
+
+**Compute:**
+- ~50 min/run on a 24 GB GPU (200 epochs, ImageNette, ViT-S/8 at 128px)
+- 30 runs total (3 variants × 10 seeds): ~25 h sequential — needs 2 nights or multiple GPUs
+- VRAM: 24 GB for `+bs=256`; use `+bs=128` on ≤16 GB cards
+- Apple Silicon (MPS): works — uses float16 autocast, single-threaded DataLoader;
+  expect ~3–5× slower than a mid-range CUDA GPU (~15 h overnight)
+
+All runs log to the `LeJEPA-projector-ablation` W&B project.
+The key metric to compare is `test/acc` at the same epoch count.
+
+---
 
 ## Demo
 
@@ -87,15 +148,20 @@ For linear probe evaluation, we use the following configuration across all model
 
 
 ## Installation
-LeJEPA is built on [PyTorch](https://pytorch.org/) and standard scientific Python libraries (e.g., NumPy). For rapid experimentation, we provide a pretraining skeleton script using `stable_pretraining`, a PyTorch Lightning wrapper. The core SIGReg loss can be integrated into any pretraining codebase.
-**Requirements:**
-- Python ≥ 3.8
-- PyTorch ≥ 1.10
-- NumPy
-- (Optional) `stable_pretraining` for provided training scripts
-**Install via pip:**
+
 ```bash
-pip install lejepa
+uv sync --group train
+```
+
+This works on macOS (MPS), Linux (CUDA 12.8), and Windows (CUDA 12.8) without
+any extra flags. PyTorch source selection is handled automatically via
+`[tool.uv.sources]` in `pyproject.toml`:
+- **macOS**: PyPI wheels (MPS-capable out of the box)
+- **Linux / Windows**: PyTorch's CUDA 12.8 index
+
+If you need a different CUDA version, update the index URL in `pyproject.toml`:
+```toml
+url = "https://download.pytorch.org/whl/cu126"  # for CUDA 12.6, etc.
 ```
 
 ## Quick Start: Using SIGReg
