@@ -37,7 +37,7 @@ if [[ "$CUDA_AVAILABLE" != "1" && "$N_GPUS" -gt 1 ]]; then
 fi
 
 EPOCHS=200
-BS=256
+BS=32
 LR=2e-3
 LAMB=0.02
 SEEDS=(0 1 2 3 4 5 6 7 8 9)

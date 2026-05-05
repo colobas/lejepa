@@ -22,6 +22,7 @@ that local projections live in the same space as global embeddings.
 """
 
 import random
+from contextlib import nullcontext
 import numpy as np
 import torch
 import torch.nn as nn
@@ -34,9 +35,36 @@ import hydra
 import tqdm
 from omegaconf import DictConfig
 from datasets import load_dataset
-from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 from torchvision.ops import MLP
+
+try:
+    # torch >= 2.1
+    from torch.amp import GradScaler
+except ImportError:
+    # torch 2.0.x
+    from torch.cuda.amp import GradScaler
+
+
+def amp_autocast(device_type: str, dtype: torch.dtype, enabled: bool):
+    """Compatibility wrapper for autocast across torch versions/devices."""
+    if not enabled:
+        return nullcontext()
+
+    # torch 2.0 only supports autocast on cuda/cpu (not mps)
+    if device_type not in ("cuda", "cpu"):
+        return nullcontext()
+
+    # torch.autocast API (works on supported device types)
+    if hasattr(torch, "autocast"):
+        return torch.autocast(device_type=device_type, dtype=dtype, enabled=True)
+
+    # Older fallback (cuda-only autocast API)
+    if device_type == "cuda":
+        from torch.cuda.amp import autocast as cuda_autocast
+        return cuda_autocast(dtype=dtype, enabled=True)
+
+    return nullcontext()
 
 
 def get_device():
@@ -71,7 +99,7 @@ class SIGReg(torch.nn.Module):
         A = A.div_(A.norm(p=2, dim=0))
         x_t = (x @ A).unsqueeze(-1) * self.t
         err = (x_t.cos().mean(-3) - self.phi).square() + x_t.sin().mean(-3).square()
-        return (err @ self.weights) * x.size(-2)
+        return (err @ self.weights).mean() * x.size(-2)
 
 
 # ---------------------------------------------------------------------------
@@ -142,8 +170,7 @@ def _base_aug(crop_size, crop_scale):
         v2.RandomApply([v2.GaussianBlur(kernel_size=7, sigma=(0.1, 2.0))]),
         v2.RandomApply([v2.RandomSolarize(threshold=128)], p=0.2),
         v2.RandomHorizontalFlip(),
-        v2.ToImage(),
-        v2.ToDtype(torch.float32, scale=True),
+        v2.ToTensor(),
         v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
@@ -152,8 +179,7 @@ def _test_transform():
     return v2.Compose([
         v2.Resize(128),
         v2.CenterCrop(128),
-        v2.ToImage(),
-        v2.ToDtype(torch.float32, scale=True),
+        v2.ToTensor(),
         v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
@@ -223,6 +249,9 @@ def main(cfg: DictConfig):
         name=f"{variant}-seed{seed}",
         config=dict(cfg),
     )
+    wandb.define_metric("global_step")
+    wandb.define_metric("train/*", step_metric="global_step")
+    wandb.define_metric("test/*", step_metric="global_step")
 
     device = get_device()
     print(f"Using device: {device}")
@@ -234,12 +263,16 @@ def main(cfg: DictConfig):
         use_scaler = False   # bfloat16 doesn't need loss scaling
     elif device.type == "mps":
         amp_dtype = torch.float16
-        use_scaler = True
+        use_scaler = False   # keep off on MPS (torch 2.0 path uses cuda scaler API)
     else:
         amp_dtype = torch.float32
         use_scaler = False
 
-    scaler = GradScaler(device=device.type, enabled=use_scaler)
+    try:
+        scaler = GradScaler(device=device.type, enabled=use_scaler)
+    except TypeError:
+        # torch 2.0.x
+        scaler = GradScaler(enabled=use_scaler)
 
     sigreg = SIGReg().to(device)
     probe = nn.Sequential(nn.LayerNorm(EMB_DIM), nn.Linear(EMB_DIM, 10)).to(device)
@@ -274,12 +307,13 @@ def main(cfg: DictConfig):
     s2 = CosineAnnealingLR(opt, T_max=total_steps - warmup_steps, eta_min=1e-3)
     scheduler = SequentialLR(opt, schedulers=[s1, s2], milestones=[warmup_steps])
 
+    global_step = 0
     for epoch in range(cfg.epochs):
         net.train()
         probe.train()
 
         for batch in tqdm.tqdm(train, total=len(train)):
-            with autocast(device.type, dtype=amp_dtype, enabled=(amp_dtype != torch.float32)):
+            with amp_autocast(device.type, dtype=amp_dtype, enabled=(amp_dtype != torch.float32)):
                 # ----------------------------------------------------------
                 if variant == "baseline":
                     vs, y = batch
@@ -320,7 +354,11 @@ def main(cfg: DictConfig):
 
                 # ----------------------------------------------------------
                 lejepa_loss = sigreg_loss * cfg.lamb + inv_loss * (1 - cfg.lamb)
-                y_rep = y.repeat_interleave(V)
+                # MPS can crash on int64 repeat_interleave; do repeat on CPU then move back
+                if device.type == "mps":
+                    y_rep = y.cpu().repeat_interleave(V).to(device)
+                else:
+                    y_rep = y.repeat_interleave(V)
                 probe_loss = F.cross_entropy(probe(emb.detach()), y_rep)
                 loss = lejepa_loss + probe_loss
 
@@ -330,11 +368,14 @@ def main(cfg: DictConfig):
             scaler.update()
             scheduler.step()
             wandb.log({
+                "global_step": global_step,
+                "epoch": epoch,
                 "train/probe": probe_loss.item(),
                 "train/lejepa": lejepa_loss.item(),
                 "train/sigreg": sigreg_loss.item(),
                 "train/inv": inv_loss.item(),
             })
+            global_step += 1
 
         # Evaluation
         net.eval()
@@ -344,13 +385,18 @@ def main(cfg: DictConfig):
             for vs, y in test:
                 vs = vs.to(device, non_blocking=True)
                 y = y.to(device, non_blocking=True)
-                with autocast(device.type, dtype=amp_dtype, enabled=(amp_dtype != torch.float32)):
+                with amp_autocast(device.type, dtype=amp_dtype, enabled=(amp_dtype != torch.float32)):
                     if variant == "local_proj":
                         emb, _, _ = net.forward_global(vs)
                     else:
                         emb, _ = net(vs)
                     correct += (probe(emb).argmax(1) == y).sum().item()
-        wandb.log({"test/acc": correct / len(test_ds), "test/epoch": epoch})
+        wandb.log({
+            "global_step": global_step,
+            "epoch": epoch,
+            "test/acc": correct / len(test_ds),
+            "test/epoch": epoch,
+        })
 
     wandb.finish()
 
